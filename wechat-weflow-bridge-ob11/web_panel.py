@@ -2,7 +2,7 @@
 Web 控制面板模块。
 
 提供可视化控制页面（http://127.0.0.1:WEB_PORT），
-支持启停/暂停/恢复桥接，显示运行状态和日志，
+支持启停桥接，显示运行状态和日志，
 以及在线编辑 config.json 配置。
 """
 
@@ -155,8 +155,6 @@ body{font-family:-apple-system,'Segoe UI',sans-serif;background:linear-gradient(
     <div class="btn-row">
       <button class="btn btn-pink" id="btnStart" onclick="action('start')">▶ 启动</button>
       <button class="btn btn-red" id="btnStop" onclick="action('stop')" disabled>■ 停止</button>
-      <button class="btn btn-amber" id="btnPause" onclick="action('pause')" disabled>⏸ 暂停</button>
-      <button class="btn btn-green" id="btnResume" onclick="action('resume')" style="display:none" disabled>▶ 恢复</button>
     </div>
 
     <div class="mode-row">
@@ -220,10 +218,9 @@ function refreshDashboard() {
   fetch('/status').then(function(r){return r.json()}).then(function(s){
     var st = document.getElementById('bridgeStatus');
     if (!s.running) { st.textContent='未运行'; st.style.color='#bdbdbd';
-    } else if (s.paused) { st.textContent='已暂停'; st.style.color='#ff9800';
     } else { st.textContent='运行中'; st.style.color='#4caf50'; }
 
-    document.getElementById('statusText').textContent = s.running ? (s.paused ? '已暂停' : '运行中') : '未运行';
+    document.getElementById('statusText').textContent = s.running ? '运行中' : '未运行';
     document.getElementById('obStatus').textContent = s.ob_connected ? '已连接' : '未连接';
     document.getElementById('obStatus').style.color = s.ob_connected ? '#4caf50' : '#bdbdbd';
     document.getElementById('weflowStatus').textContent = s.weflow_connected ? '已连接' : '未连接';
@@ -232,15 +229,6 @@ function refreshDashboard() {
 
     document.getElementById('btnStart').disabled = s.running;
     document.getElementById('btnStop').disabled = !s.running;
-    if (s.paused) {
-      document.getElementById('btnPause').style.display = 'none';
-      document.getElementById('btnResume').style.display = 'inline-block';
-      document.getElementById('btnResume').disabled = false;
-    } else {
-      document.getElementById('btnPause').style.display = 'inline-block';
-      document.getElementById('btnPause').disabled = !s.running;
-      document.getElementById('btnResume').style.display = 'none';
-    }
 
     document.getElementById('modeStatus').textContent = modeMap[s.group_reply_mode] || s.group_reply_mode;
 
@@ -377,7 +365,6 @@ class WebHandler(BaseHTTPRequestHandler):
                 pass
             self.send_json({
                 "running": state.running,
-                "paused": state.paused.is_set(),
                 "send_method": "uia",
                 "ob_url": config.ASTRBOT_OB_URL,
                 "ob_connected": ob_connected,
@@ -407,14 +394,6 @@ class WebHandler(BaseHTTPRequestHandler):
         elif self.path == "/stop":
             from main import _stop_bridge
             _stop_bridge()
-            self.send_json({"ok": True})
-        elif self.path == "/pause":
-            state.paused.set()
-            log.info("[Web] 已暂停")
-            self.send_json({"ok": True})
-        elif self.path == "/resume":
-            state.paused.clear()
-            log.info("[Web] 已恢复")
             self.send_json({"ok": True})
         elif self.path == "/mode":
             mode_order = ["mention", "all", "batch"]

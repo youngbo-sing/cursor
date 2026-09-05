@@ -19,8 +19,6 @@ from typing import Optional
 # ============ 状态控制 ============
 
 running = False
-paused = threading.Event()
-paused.clear()
 run_lock = threading.Lock()
 bridge_thread = None
 

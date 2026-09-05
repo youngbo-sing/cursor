@@ -1,0 +1,25 @@
+{
+    "_comment": "微信 ↔ AstrBot 桥接 - OneBot v11 版配置示例，复制为 config.json 后填写真实值",
+    "weflow_base_url": "http://127.0.0.1:5031",
+    "access_token": "你的WeFlow_Access_Token",
+    "astrbot_attachments": "C:\\astrbot\\data\\attachments",
+    "bot_nicknames": [
+        "机器人微信昵称"
+    ],
+    "bot_wxid": "机器人自己的wxid_xxx",
+    "send_method": "uia",
+    "weflow_send_api": "http://127.0.0.1:5031/api/v1/messages",
+    "buffer_seconds": 2,
+    "web_port": 8766,
+    "group_reply_mode": "mention",
+    "mention_awake_timeout": 180,
+    "astrbot_ob_url": "ws://127.0.0.1:19777/ws",
+    "ollama_base_url": "http://127.0.0.1:61000",
+    "ollama_model": "llava:7b",
+    "ollama_timeout": 60,
+    "image_caption_provider": "openai",
+    "image_caption_model": "agnes-2.5-flash",
+    "image_caption_api_key": "你的API_Key",
+    "image_caption_api_base": "https://api.agnes-ai.cn/v1",
+    "image_caption_prompt": "请用中文简短描述这张图片的内容"
+}

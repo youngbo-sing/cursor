@@ -32,7 +32,6 @@ def _start_bridge():
         if state.running:
             return
         state.running = True
-    state.paused.clear()
     state.sender_instance = create_sender()
 
     if not state.ob_client_started:
