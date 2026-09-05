@@ -5,18 +5,15 @@
 1. 连接 WeFlow SSE 推送，接收微信消息
 2. 消息缓冲合并（BUFFER_SECONDS）
 3. 构造 OneBot 事件，推送给 AstrBot
-4. 多层消息去重（rawid、内容、自回复）
+4. 多层消息去重（messageKey、图片 messageKey）
 """
 
 import json
 import logging
 import os
-import queue
 import re
 import threading
 import time
-from collections import defaultdict
-from datetime import datetime
 
 import requests
 
@@ -41,14 +38,8 @@ class WeFlowBridge:
         self.start_timestamp = int(time.time())
         self.pending_buffers = {}
         self.buffer_lock = threading.Lock()
-        self.chat_histories = defaultdict(list)
-        self.contact_map = {}
         self._sse_session = None
-        self._recent_seen = {}
-        self._sent_recently = {}
-        self._sse_event_keys = {}
-        self._pending_image = {}  # talkerId → {"caption": None|str, "event": threading.Event()}
-        self._pending_mention_images = {}  # session_id → {"data": data, "time": timestamp} 先图后文暂存
+        self._pending_mention_images = {}  # session_id → sender_key → {"data": data, "time": ...}
         self._group_awake = {}  # session_id → 群内最后一条被接受消息的时间戳，用于 @触发后的一段时间免@回复
 
     def should_ignore(self, data):
@@ -86,6 +77,101 @@ class WeFlowBridge:
             or data.get("talkerName")
             or "未知"
         )
+
+    def _sender_wxid(self, data) -> str:
+        """提取发言人的稳定 wxid。
+
+        WeFlow 群消息没有独立的发言人 wxid 字段：文本 content 会以
+        "wxid_xxx:\n" 开头，图片/表情则把 wxid 编进 messageKey，
+        两种都会在推送里出现。
+        """
+        wxid = data.get("talkerId", "") or ""
+        if wxid:
+            return str(wxid).strip()
+        match = re.match(r"^(wxid_[^\s:]+):\s*\n?", data.get("content", "") or "")
+        if match:
+            return match.group(1)
+        raw_key = data.get("messageKey") or data.get("rawid") or ""
+        key_parts = str(raw_key).split(":")
+        if len(key_parts) >= 3 and key_parts[-2].startswith("wxid_"):
+            return key_parts[-2]
+        return ""
+
+    def _mention_sender_key(self, data) -> str:
+        """先图后文缓存的群内发送者 key：优先 wxid，缺省退回显示名。"""
+        wxid = self._sender_wxid(data)
+        return wxid or f"name:{self._speaker_name(data)}"
+
+    def _queue_key(self, data, session_id_data, is_group) -> str:
+        """文字与图片/表情共用同一个缓冲 key。
+
+        WeFlow 图片/表情没有顶层 talkerId，旧实现分别按 talkerId 和昵称
+        查找队列导致图+文经常命中失败；这里群内统一按 sessionId+发送者归类，
+        batch 模式整群共用一个队列，私聊直接用 sessionId。
+        """
+        if is_group and state.group_reply_mode == "batch":
+            return f"__batch__{session_id_data}"
+        sender_key = self._sender_wxid(data) or self._speaker_name(data)
+        if is_group and sender_key:
+            return f"{session_id_data}|{sender_key}"
+        return session_id_data
+
+    def _cleanup_pending_mention_images(self):
+        """清理所有已过期、等待 @ 文字关联的图片/表情，避免无 @ 消息占内存。"""
+        now = time.time()
+        empty_sessions = []
+        for session_id, per_session in list(self._pending_mention_images.items()):
+            stale = [k for k, item in per_session.items() if now - item["time"] > 15]
+            for key in stale:
+                del per_session[key]
+            if not per_session:
+                empty_sessions.append(session_id)
+        for session_id in empty_sessions:
+            self._pending_mention_images.pop(session_id, None)
+
+    def _store_mention_image(self, session_id, data):
+        """按群+发送者暂存一张未关联文字的消息，并清理过期项。"""
+        now = time.time()
+        per_session = self._pending_mention_images.setdefault(session_id, {})
+        stale = [k for k, item in per_session.items() if now - item["time"] > 15]
+        for key in stale:
+            del per_session[key]
+        sender_key = self._mention_sender_key(data)
+        per_session[sender_key] = {
+            "data": data,
+            "time": now,
+            "sender_wxid": self._sender_wxid(data),
+            "sender_name": self._speaker_name(data),
+        }
+
+    def _take_mention_image(self, session_id, data):
+        """取出发言人与当前文字匹配的暂存图；不匹配则保留给本人。"""
+        now = time.time()
+        per_session = self._pending_mention_images.get(session_id)
+        if not per_session:
+            return None
+        matched_key = None
+        for key, item in list(per_session.items()):
+            if now - item["time"] > 15:
+                del per_session[key]
+                continue
+            a_wxid = item.get("sender_wxid", "")
+            a_name = item.get("sender_name", "")
+            b_wxid = self._sender_wxid(data)
+            b_name = self._speaker_name(data)
+            if a_wxid and b_wxid:
+                if a_wxid == b_wxid:
+                    matched_key = key
+            elif a_name and a_name == b_name:
+                matched_key = key
+        if matched_key:
+            item = per_session.pop(matched_key)
+            if not per_session:
+                self._pending_mention_images.pop(session_id, None)
+            return item
+        if not per_session:
+            self._pending_mention_images.pop(session_id, None)
+        return None
 
     def _clean_content(self, content: str) -> str:
         """清理群消息正文：剥掉前导的'发送者wxid:换行'之类的占位前缀。"""
@@ -149,6 +235,7 @@ class WeFlowBridge:
 
     def add_to_buffer(self, data):
         """将消息加入缓冲区，等待合并后统一推送给 AstrBot。"""
+        self._cleanup_pending_mention_images()
         content = data.get("content", "")
         source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
 
@@ -161,8 +248,8 @@ class WeFlowBridge:
             # 图片消息（mention 模式下需 @ 或群在唤醒期才处理）
             if is_group and not self._check_group_accept(session_id_data, self._is_mentioned(data)):
                 # 先图后文：暂存图片，等后续同人发 @ 文字时合并
-                self._pending_mention_images[session_id_data] = {"data": data, "time": time.time()}
-                log.info(f"📸 暂存图片，等待关联 @ 文字 (session={session_id_data})")
+                self._store_mention_image(session_id_data, data)
+                log.info(f"📸 暂存 {source_name} 的图片，等待本人 @ 文字 (session={session_id_data})")
                 return
             threading.Thread(target=self.process_image_message,
                            args=(data,), daemon=True).start()
@@ -172,36 +259,26 @@ class WeFlowBridge:
             # 表情包消息（mention 模式下需 @ 或群在唤醒期才处理）
             if is_group and not self._check_group_accept(session_id_data, self._is_mentioned(data)):
                 # 先图后文：暂存表情，等后续同人发 @ 文字时合并
-                self._pending_mention_images[session_id_data] = {"data": data, "time": time.time()}
-                log.info(f"😀 暂存表情，等待关联 @ 文字 (session={session_id_data})")
+                self._store_mention_image(session_id_data, data)
+                log.info(f"😀 暂存 {source_name} 的表情，等待本人 @ 文字 (session={session_id_data})")
                 return
             threading.Thread(target=self.process_emoji_message,
                            args=(data,), daemon=True).start()
             return
 
-        now = time.time()
-        if content and content in self._sent_recently and now - self._sent_recently[content] < 120:
-            log.info(f"⏭️ 自回复去重跳过: {content[:30]}")
-            return
-
         sender_in_group = self._speaker_name(data)
+        speaker_wxid = self._sender_wxid(data) if is_group else ""
 
         if is_group:
             if not self._check_group_accept(session_id_data, self._is_mentioned(data)):
                 log.info(f"⏭️ 群未唤醒且未 @ 机器人，跳过: [{sender_in_group}] {content[:40]}")
                 return
             group_raw = group_name_raw or source_name
-            base_name = re.sub(r'\s*\(\d+\)\s*$', '', group_raw).strip()
-            contact = base_name
+            contact = group_raw.strip()
         else:
             contact = source_name
 
-        if is_group and state.group_reply_mode == "batch":
-            buffer_key = f"__batch__{base_name}"
-        elif is_group and sender_in_group:
-            buffer_key = f"{session_id_data}_{sender_in_group}"
-        else:
-            buffer_key = session_id_data
+        buffer_key = self._queue_key(data, session_id_data, is_group)
 
         with self.buffer_lock:
             if buffer_key not in self.pending_buffers:
@@ -213,12 +290,15 @@ class WeFlowBridge:
                     "contact": contact,
                     "is_group": is_group,
                     "source_name": source_name,
-                    "group_name": base_name if is_group else "",
+                    "group_name": contact if is_group else "",
                     "sender_in_group": sender_in_group if is_group else "",
                     "session_id_data": session_id_data,
+                    "speaker_wxid": speaker_wxid,
                 }
             entry = self.pending_buffers[buffer_key]
             if is_group:
+                if not entry.get("speaker_wxid"):
+                    entry["speaker_wxid"] = speaker_wxid
                 cleaned = self._clean_content(self._strip_at(content)) or content
             else:
                 cleaned = content
@@ -233,10 +313,10 @@ class WeFlowBridge:
                 # 检查是否有暂存的图片（先图后文场景）
                 has_pending_image = False
                 if is_group and state.group_reply_mode == "mention":
-                    cached = self._pending_mention_images.pop(session_id_data, None)
-                    if cached and time.time() - cached["time"] < 15:
+                    cached = self._take_mention_image(session_id_data, data)
+                    if cached:
                         has_pending_image = True
-                        log.info(f"📸 检测到关联图片，延长缓冲等待描述")
+                        log.info(f"📸 检测到 {sender_in_group} 本人的关联图片，延长缓冲等待描述")
                         # 异步下载并描述图片，完成后注入 buffer
                         threading.Thread(
                             target=self._inject_cached_image,
@@ -286,10 +366,14 @@ class WeFlowBridge:
 
         # 构建 OneBot 事件：user_id=发言人，group_id=群会话，正文保持原话
         if is_group:
-            sender_key = speaker_wxid or sender_name
+            if speaker_wxid:
+                sender_key = speaker_wxid
+            elif session_id_data:
+                sender_key = f"{session_id_data}|{sender_name}"
+            else:
+                sender_key = sender_name
             user_id = state._wxid_to_int(sender_key)
-            group_key = entry.get("group_name", contact) or session_id_data
-            group_id = state._wxid_to_int(group_key)
+            group_id = state._wxid_to_int(session_id_data or contact)
             text = combined or "你好"
 
             # 群聊必须带 at 机器人，否则 AstrBot 不当成对自己说，不会回复
@@ -303,7 +387,8 @@ class WeFlowBridge:
                 group_name=entry.get("group_name", contact),
                 nickname=sender_name,
             )
-            state._ob_id_to_contact[group_id] = contact
+            group_display = entry.get("group_name", "") or contact
+            state._ob_id_to_contact[group_id] = group_display
             state._ob_id_to_contact[user_id] = sender_name
             log.info(f"📤 群事件 group_id={group_id} user={sender_name}/{user_id} text={text[:40]}")
         else:
@@ -325,7 +410,18 @@ class WeFlowBridge:
 
         with self.buffer_lock:
             if sender_id in self.pending_buffers:
-                self.pending_buffers[sender_id]["processing"] = False
+                entry = self.pending_buffers[sender_id]
+                entry["processing"] = False
+                # 异步图片/表情在推送间隙注入的消息不能丢：补一个短计时器
+                if entry["messages"] and not entry["timer"]:
+                    entry["timer_version"] += 1
+                    version = entry["timer_version"]
+                    timer = threading.Timer(
+                        1.5, lambda v=version, sid=sender_id: self.process_sender(sid, v)
+                    )
+                    timer.daemon = True
+                    timer.start()
+                    entry["timer"] = timer
 
     def listen_sse(self):
         """连接 WeFlow SSE 推送。"""
@@ -454,12 +550,27 @@ class WeFlowBridge:
             log.error(f"获取微信图片异常: {e}")
             return None
 
+    def _schedule_buffer_flush(self, buffer_key, delay):
+        """持有 buffer_lock 时给缓冲条目补/重设推送计时器。"""
+        entry = self.pending_buffers.get(buffer_key)
+        if entry is None or entry.get("processing"):
+            return
+        if entry.get("timer"):
+            entry["timer"].cancel()
+        entry["timer_version"] += 1
+        version = entry["timer_version"]
+        timer = threading.Timer(
+            delay, lambda v=version, sid=buffer_key: self.process_sender(sid, v)
+        )
+        timer.daemon = True
+        timer.start()
+        entry["timer"] = timer
+
     def process_image_message(self, data):
         """处理图片消息：从 WeFlow 取图 → ollama 描述 → 注入缓冲区"""
         session_id = data.get("sessionId", "")
-        source_name = data.get("sourceName", "") or "未知"
-        group_name = data.get("groupName", "")
-        rawid = data.get("rawid", "")
+        source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
+        group_name_raw = data.get("groupName", "") or ""
         msg_key = data.get("messageKey", "") or data.get("rawid", "") or ""
 
         # 按唯一 messageKey 去重，防止 WeFlow SSE 重复投递导致重复处理
@@ -473,121 +584,89 @@ class WeFlowBridge:
                 if len(self._processed_image_keys) > 5000:
                     self._processed_image_keys.clear()
 
+        session_id_data = session_id or source_name
+        is_group = self._is_group(data)
+        sender_wxid = self._sender_wxid(data) if is_group else ""
+        sender_name = self._speaker_name(data)
+        buffer_key = self._queue_key(data, session_id_data, is_group)
+        group_contact = group_name_raw.strip() if is_group and group_name_raw else source_name
+
         log.info(f"🖼️ 收到图片: {source_name}" +
-                 (f" (群:{group_name})" if group_name else ""))
+                 (f" (群:{group_name_raw})" if group_name_raw else ""))
 
-        talker_id = data.get("talkerId", "") or data.get("sessionId", "")
-        is_group = bool(group_name) or "@chatroom" in session_id
+        # 取图 + ollama 描述
+        image_path = self._fetch_wechat_image(session_id)
+        caption = None
+        if image_path:
+            caption = caption_image_via_ollama(image_path)
 
-        # 注册待处理的图片（ollama 完成前标记为 pending）
-        img_event = threading.Event()
-        self._pending_image[talker_id] = {"caption": None, "event": img_event}
+        caption_text = caption if caption else None
+        if caption_text:
+            log.info(f"📝 图片描述: {caption_text[:60]}...")
+        else:
+            log.info("⚠️ 图片描述失败")
+            caption_text = "（图片内容无法描述）"
 
-        try:
-            # 取图 + ollama 描述
-            image_path = self._fetch_wechat_image(session_id)
-            caption = None
-            if image_path:
-                caption = caption_image_via_ollama(image_path)
-
-            caption_text = caption if caption else None
-            if caption_text:
-                log.info(f"📝 图片描述: {caption_text[:60]}...")
+        # 注入图片描述到缓冲区
+        with self.buffer_lock:
+            image_text = f"[图片: {caption_text}]"
+            batch_mode = is_group and state.group_reply_mode == "batch"
+            batch_text = f'成员"{source_name}"在群"{group_name_raw}"中对你说：{image_text}'
+            queued_text = batch_text if batch_mode else image_text
+            entry = self.pending_buffers.get(buffer_key)
+            if entry is not None:
+                # 已有同 key 文本/图片在排队，图片先到放最前，保持时间顺序
+                entry["messages"].insert(0, queued_text)
+                log.info(f"📝 图片已注入队列 ({buffer_key})")
+                if not entry.get("processing") and not entry.get("timer"):
+                    self._schedule_buffer_flush(buffer_key, 1.5)
+            elif is_group and state.group_reply_mode == "batch":
+                # 没有文字排队，用整群共享 batch key 创建独立图片条目
+                self.pending_buffers[buffer_key] = {
+                    "messages": [queued_text],
+                    "timer": None,
+                    "timer_version": 0,
+                    "processing": False,
+                    "contact": group_contact,
+                    "is_group": True,
+                    "source_name": source_name,
+                    "session_id_data": session_id_data,
+                    "group_name": group_name_raw.strip(),
+                    "sender_in_group": sender_name,
+                    "speaker_wxid": sender_wxid,
+                }
+                log.info(f"📩 图片无文本跟随，创建批处理图片条目")
+                self._schedule_buffer_flush(buffer_key, 5)
             else:
-                log.info("⚠️ 图片描述失败")
-                caption_text = "（图片内容无法描述）"
-
-            # 注入图片描述到缓冲区
-            with self.buffer_lock:
-                self._pending_image[talker_id] = {"caption": caption_text, "event": img_event}
-
-                # 批处理模式用群共享 key
-                if is_group and state.group_reply_mode == "batch" and group_name:
-                    g_base = re.sub(r'\s*\(\d+\)\s*$', '', group_name).strip()
-                    batch_key = f"__batch__{g_base}"
-                    if batch_key in self.pending_buffers:
-                        entry = self.pending_buffers[batch_key]
-                        entry["messages"].insert(0, f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]')
-                        entry["image_ready"] = True
-                        log.info(f"📝 图片已注入批处理队列")
-                        return
-                    # 没有文字排队，用 batch key 创建独立条目
-                    self.pending_buffers[batch_key] = {
-                        "messages": [f'成员"{source_name}"在群"{group_name}"中对你说：[图片: {caption_text}]'],
-                        "timer": None,
-                        "timer_version": 0,
-                        "processing": False,
-                        "contact": group_name,
-                        "is_group": True,
-                        "source_name": source_name,
-                        "session_id_data": session_id,
-                        "group_name": group_name,
-                        "sender_in_group": source_name,
-                    }
-                    log.info(f"📩 图片无文本跟随，创建批处理图片条目")
-                    version = 1
-                    timer = threading.Timer(5, lambda v=version, sid=batch_key: self.process_sender(sid, v))
-                    timer.daemon = True
-                    timer.start()
-                    self.pending_buffers[batch_key]["timer"] = timer
-                    self.pending_buffers[batch_key]["timer_version"] = version
-                elif talker_id in self.pending_buffers:
-                    # 已有文本在排队，注入图片上下文
-                    entry = self.pending_buffers[talker_id]
-                    entry["messages"].insert(0, f"[图片: {caption_text}]")
-                    entry["image_ready"] = True
-                    log.info(f"📝 图片已注入待处理文本队列")
-                    # 若该缓冲无活跃 timer 且未在 processing，补一个 timer 保证推送
-                    if not entry.get("processing") and not entry.get("timer"):
-                        entry["timer_version"] += 1
-                        version = entry["timer_version"]
-                        tid_later = talker_id
-                        timer = threading.Timer(1.5, lambda v=version, sid=tid_later: self.process_sender(sid, v))
-                        timer.daemon = True
-                        timer.start()
-                        entry["timer"] = timer
-                        log.info(f"📤 检测到无活跃 timer，补充推送计时器 ({talker_id})")
-                else:
-                    # 没有文本排队，创建单条图片消息处理
-                    log.info(f"📩 图片无文本跟随，直接处理")
-                    self.pending_buffers[talker_id] = {
-                        "messages": [f"[图片: {caption_text}]"],
-                        "timer": None,
-                        "timer_version": 0,
-                        "processing": False,
-                        "contact": group_name if is_group and group_name else source_name,
-                        "is_group": is_group,
-                        "source_name": source_name,
-                        "session_id_data": session_id,
-                        "group_name": group_name if is_group else "",
-                        "sender_in_group": "",
-                    }
-                    version = 1
-                    timer = threading.Timer(2, lambda v=version, sid=talker_id: self.process_sender(sid, v))
-                    timer.daemon = True
-                    timer.start()
-                    self.pending_buffers[talker_id]["timer"] = timer
-                    self.pending_buffers[talker_id]["timer_version"] = version
-        finally:
-            # 确保 Event 被设置
-            img_event.set()
+                # 没有文本排队，创建单条图片消息处理
+                log.info(f"📩 图片无文本跟随，直接处理")
+                self.pending_buffers[buffer_key] = {
+                    "messages": [queued_text],
+                    "timer": None,
+                    "timer_version": 0,
+                    "processing": False,
+                    "contact": group_contact,
+                    "is_group": is_group,
+                    "source_name": source_name,
+                    "session_id_data": session_id_data,
+                    "group_name": group_name_raw.strip() if is_group else "",
+                    "sender_in_group": sender_name if is_group else "",
+                    "speaker_wxid": sender_wxid,
+                }
+                self._schedule_buffer_flush(buffer_key, 2)
 
     def process_emoji_message(self, data):
         """处理表情包消息：尝试下载图片并描述，失败则保留原文转发"""
-        session_id = data.get("sessionId", "")
         source_name = data.get("sourceName", "") or "未知"
-        group_name = data.get("groupName", "")
+        group_name_raw = data.get("groupName", "") or ""
         content = data.get("content", "[表情]")
 
         log.info(f"😀 收到表情包: {source_name}" +
-                 (f" (群:{group_name})" if group_name else ""))
-
-        talker_id = data.get("talkerId", "") or data.get("sessionId", "")
-        is_group = bool(group_name) or "@chatroom" in session_id
+                 (f" (群:{group_name_raw})" if group_name_raw else ""))
 
         # 尝试下载图片描述
         try:
-            image_path = self._fetch_wechat_image(session_id)
+            image_path = self._fetch_wechat_image(data.get("sessionId", ""))
             if image_path:
                 caption = caption_image_via_ollama(image_path)
                 if caption:
@@ -599,13 +678,11 @@ class WeFlowBridge:
                 log.info("😀 表情包无可用图片，保留原文")
 
             # 直接注入缓冲区（不等待，立即推送）
-            self.add_text_to_buffer(talker_id, source_name, group_name,
-                                    session_id, content, is_group, talker_id)
+            self.add_text_to_buffer(data, content)
         except Exception as e:
             log.warning(f"😀 表情包处理异常: {e}")
             # 异常时也保底发送原文
-            self.add_text_to_buffer(talker_id, source_name, group_name,
-                                    session_id, content, is_group, talker_id)
+            self.add_text_to_buffer(data, content)
 
     def _inject_cached_image(self, session_id, buffer_key, version):
         """下载缓存图片 → 描述 → 注入到 buffer 条目（在缓冲计时器到期前完成）"""
@@ -623,43 +700,45 @@ class WeFlowBridge:
                     if entry.get("timer_version") == version:
                         entry["messages"].insert(0, text)
                         log.info(f"📸 缓存图片已注入: {text[:60]}")
+                        if not entry.get("processing") and not entry.get("timer"):
+                            self._schedule_buffer_flush(buffer_key, 1.5)
                     else:
                         log.info(f"📸 缓存图片跳过（buffer 版本已变更）")
         except Exception as e:
             log.warning(f"📸 缓存图片处理异常: {e}")
 
-    def add_text_to_buffer(self, session_id_data, source_name, group_name,
-                           session_id, content, is_group, sender_key):
-        """通用：将一段文本直接加入缓冲队列（供表情/图片等异步处理完后调用）"""
+    def add_text_to_buffer(self, data, content):
+        """通用：将异步处理完的内容（如表情描述）加入与文字同一 key 的缓冲队列。"""
+        source_name = data.get("sourceName", "") or data.get("talkerName", "") or "未知"
+        group_name_raw = data.get("groupName", "") or ""
+        session_id_data = data.get("sessionId", "") or source_name
+        is_group = self._is_group(data)
+        sender_wxid = self._sender_wxid(data) if is_group else ""
+        sender_name = self._speaker_name(data)
+        group_contact = group_name_raw.strip() if is_group and group_name_raw else source_name
+        buffer_key = self._queue_key(data, session_id_data, is_group)
         with self.buffer_lock:
-            buffer_key = sender_key
             if buffer_key not in self.pending_buffers:
                 self.pending_buffers[buffer_key] = {
                     "messages": [],
                     "timer": None,
                     "timer_version": 0,
                     "processing": False,
-                    "contact": group_name if is_group and group_name else source_name,
+                    "contact": group_contact,
                     "is_group": is_group,
                     "source_name": source_name,
-                    "session_id_data": session_id,
-                    "group_name": group_name if is_group else "",
-                    "sender_in_group": source_name if is_group else "",
+                    "session_id_data": session_id_data,
+                    "group_name": group_name_raw.strip() if is_group else "",
+                    "sender_in_group": sender_name if is_group else "",
+                    "speaker_wxid": sender_wxid,
                 }
             entry = self.pending_buffers[buffer_key]
             entry["messages"].append(content)
 
             if not entry["processing"]:
-                if entry["timer"]:
-                    entry["timer"].cancel()
-                entry["timer_version"] += 1
-                version = entry["timer_version"]
-                delay = 2  # 表情/图片单独推送，短缓冲
-                timer = threading.Timer(delay, lambda v=version, sid=buffer_key: self.process_sender(sid, v))
-                timer.daemon = True
-                timer.start()
-                entry["timer"] = timer
-                entry["timer_version"] = version
+                # 表情/图片单独推送，短缓冲
+                self._schedule_buffer_flush(buffer_key, 2)
+
 def caption_image_via_ollama(image_path: str) -> str | None:
     """对图片进行文字描述，支持 ollama 和 OpenAI 兼容 API 两种后端。"""
     try:
