@@ -48,6 +48,15 @@ def _normalize_message(message) -> list:
     return []
 
 
+def _mark_group_replied(is_group: bool, target_id: int) -> None:
+    """AstrBot 成功向群发送内容后记录时间，供群文本随机首等使用。"""
+    if not is_group or not target_id:
+        return
+    bridge = state.bridge_instance
+    if bridge is not None:
+        bridge.mark_group_replied(target_id)
+
+
 def _build_api_data(action: str, params: dict):
     """构造常见 OneBot API 的 data，避免 AstrBot 拿到空对象。"""
     if action == "get_login_info":
@@ -143,6 +152,7 @@ async def _handle_ob_api(data: dict):
                 if text:
                     await asyncio.to_thread(state.sender_instance.send_text, contact, text)
                     log.info(f"[OB11] 文字已发送至 {contact}: {text[:50]}")
+                    _mark_group_replied(is_group, target_id)
 
             elif seg_type == "image":
                 file_val = seg_data.get("file", "")
@@ -180,6 +190,7 @@ async def _handle_ob_api(data: dict):
                         # 使用线程池执行同步的 UIA 发送，避免阻塞事件循环
                         await asyncio.to_thread(state.sender_instance.send_image, contact, img_path)
                         log.info(f"[OB11] 图片已发送至 {contact}")
+                        _mark_group_replied(is_group, target_id)
                     finally:
                         # 临时文件用完删除
                         if img_path and "tmp" in img_path:
@@ -191,6 +202,7 @@ async def _handle_ob_api(data: dict):
             elif seg_type == "face":
                 await asyncio.to_thread(state.sender_instance.send_text, contact, "[表情]")
                 log.info(f"[OB11] 表情已发送至 {contact}")
+                _mark_group_replied(is_group, target_id)
 
             # 其他类型（record, video 等）忽略
 
