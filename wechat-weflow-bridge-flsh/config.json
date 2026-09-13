@@ -1,0 +1,25 @@
+{
+    "_comment": "微信 ↔ AstrBot 桥接 - OneBot v11 版配置",
+    "weflow_base_url": "http://127.0.0.1:5031",
+    "access_token": "c3830ba9068581190f57c3b0d74fb577",
+    "astrbot_attachments": "C:\\astrbot\\data\\attachments",
+    "bot_nicknames": [
+        "星绪"
+    ],
+    "bot_wxid": "wxid_nbklo0qyvqvz22_b3e9",
+    "send_method": "uia",
+    "weflow_send_api": "http://127.0.0.1:5031/api/v1/messages",
+    "buffer_seconds": 2,
+    "web_port": 8766,
+    "group_reply_mode": "mention",
+    "mention_awake_timeout": 180,
+    "astrbot_ob_url": "ws://192.168.153.132:11229/ws",
+    "ollama_base_url": "http://127.0.0.1:61000",
+    "ollama_model": "llava:7b",
+    "ollama_timeout": 60,
+    "image_caption_provider": "openai",
+    "image_caption_model": "agnes-2.5-flash",
+    "image_caption_api_key": "sk-QndJk2f3qcR8UUXaKo5dlGhmbnb5YJJb8oTHSTtbzZ5HTsxl",
+    "image_caption_api_base": "https://api.agnes-ai.cn/v1",
+    "image_caption_prompt": "请用中文简短描述这张图片的内容"
+}
